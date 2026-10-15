@@ -3,14 +3,14 @@
 ```text
 ./
 ├── cot_generation/   # prompt00, multi-round conversation, error correction, convert CoT
-├── dataset/          # data construction for SFT
+├── dataset/          # SFT and DPO data
 ├── inference/        # SFT model inference
 ├── evaluation/       # Evaluation metrics
 ├── requirements.txt
 └── README.md
 ```
 
-Overall pipeline: GT correction, CoT, dataset, SFT, inference, evaluation.
+Overall pipeline: GT correction, CoT, dataset, SFT, optional DPO, inference, evaluation.
 
 ## Setup
 
@@ -101,7 +101,7 @@ One patient instead:
 python cot_generation/multiauto.py --patient_folder patient_001
 ```
 
-Generate CoT from completed cases without `FAILED.txt`:
+Generate CoT:
 
 ```bash
 python cot_generation/genCoTauto.py
@@ -165,7 +165,7 @@ Example output prefixes (`SAVED_PATH`):
 
 Each prefix produces `_train.jsonl` and `_val.jsonl`. Use the same prefix for `DATA_PREFIX` in the training command.
 
-Patient split: about 80% training and 20% validation within each left/right dominance group, with seed 42. SYNTAX classes for SFT and evaluation: `Low <= 22` and `High > 22`. We combine Intermediate and High to reduce class imbalance and support more stable recall estimates.
+Patient split: about 80% training and 20% validation within each left/right dominance group, with seed 42. SYNTAX classes for SFT and evaluation: `Low <= 22` and `High (Medium included) > 22`.
 
 Both builders use the same oversampling method. After the patient split, they repeat samples from the smaller training dominance group until both groups have the same size. No oversampling in validation.
 
@@ -176,6 +176,8 @@ For clean and masked CoT, use `build_cot_sft_dataset.py` with separate `COT_PATH
 ### SFT training
 
 Models: `Qwen3-VL-4B-Thinking`, `Qwen3-VL-8B-Thinking`, `InternVL2-8B`, `MiniCPM-V-2_6`.
+
+SFT reads the system and user prompts from the JSONL messages. Set `SYSTEM_PROMPT` and `USER_PROMPT` in the dataset builders; rebuild the datasets after changing them.
 
 Set the model, dataset and output paths below. Change `CUDA_VISIBLE_DEVICES` to use your GPU. Adjust `--save_steps`, `--eval_steps`, `--per_device_train_batch_size` and `--max_length` for your hardware and dataset.
 
@@ -265,3 +267,79 @@ Input: a JSON array. Each record includes `gt_parsed` and `pred_parsed` answer d
 Classification metrics: Accuracy, macro Precision, Recall and F1, plus a confusion matrix. Regression metrics for `lesion_count` and `syntax_score`: MSE, RMSE and MAE. The evaluator counts missing classification predictions as `parse_error` and uses 0 for missing regression predictions.
 
 Output: `<input_name>_full_metrics.json` in the input file's folder.
+
+## 4. DPO (optional)
+
+### Build preference data
+
+Use the clean CoT `_train.jsonl` and its merged SFT model to generate four candidates per input. Each pair uses the reference CoT + answer as the chosen response and a candidate rejected by the Qwen3-VL-32B judge as the rejected response.
+
+Set these paths at the top of `dataset/generate_dpo_data.py`:
+
+| Setting | Path |
+|---|---|
+| `MODEL_SFT_PATH` | Merged CoT SFT model |
+| `MODEL_JUDGE_PATH` | Qwen3-VL-32B-Instruct model |
+| `INTERMEDIATE_FILE` | Candidate cache `.jsonl` |
+
+Create the cache and output parent folders. Image paths in the input JSONL must be accessible from the repository root; use full paths.
+
+```bash
+mkdir -p "/path/to/your/datasets"
+python dataset/generate_dpo_data.py \
+  --input_file "/path/to/your/datasets/cot_sft_train.jsonl" \
+  --output_file "/path/to/your/datasets/dpo_train.jsonl"
+```
+
+An existing `INTERMEDIATE_FILE` skips generation. Remove it or use a new path when changing the input or SFT model, or after incomplete generation.
+
+Both stages use GPU 0. The 32B judge must fit on that GPU. Adjust `--generator_batch_size`, `--judge_batch_size`, `max_model_len` and GPU memory settings for your hardware.
+
+### DPO training
+
+Use the same merged CoT SFT model and generated DPO JSONL as above. Train a new LoRA adapter; the frozen merged SFT model serves as the reference.
+
+```bash
+MODEL_DIR="/path/to/your/merged_cot_sft_model"
+DPO_DATA="/path/to/your/datasets/dpo_train.jsonl"
+OUTPUT_DIR="/path/to/your/dpo_output"
+
+export PYTHONUNBUFFERED=1
+export SWIFT_PATCH_CONV3D=1
+mkdir -p "$OUTPUT_DIR"
+
+CUDA_VISIBLE_DEVICES=0 MAX_PIXELS=1003520 swift rlhf \
+  --rlhf_type dpo \
+  --model "$MODEL_DIR" \
+  --dataset "$DPO_DATA" \
+  --load_from_cache_file true \
+  --split_dataset_ratio 0.01 \
+  --train_type lora \
+  --torch_dtype bfloat16 \
+  --num_train_epochs 1 \
+  --per_device_train_batch_size 2 \
+  --per_device_eval_batch_size 2 \
+  --learning_rate 5e-6 \
+  --lora_rank 8 \
+  --lora_alpha 32 \
+  --target_modules all-linear \
+  --freeze_vit true \
+  --freeze_aligner true \
+  --gradient_accumulation_steps 8 \
+  --eval_steps 20 \
+  --save_steps 20 \
+  --logging_steps 4 \
+  --max_length 8192 \
+  --output_dir "$OUTPUT_DIR" \
+  --warmup_ratio 0.05 \
+  --dataloader_num_workers 4 \
+  --rpo_alpha 0.1 \
+  --dataset_num_proc 4 \
+  --lr_scheduler_type cosine_with_min_lr \
+  --lr_scheduler_kwargs '{"min_lr": 1e-8}' \
+  > "$OUTPUT_DIR/train.log" 2>&1
+```
+
+This command reserves about 1% of the preference training data for validation. `--rpo_alpha 0.1` adds a chosen-response negative log-likelihood term weighted by 0.1 to the DPO loss. Adjust batch sizes, `--save_steps`, `--eval_steps` and `--max_length` for your hardware and data size.
+
+Reuse the export, inference and evaluation steps above with the DPO checkpoint and the original patient-level clean CoT validation set. Use a separate merged-model output folder for DPO.
