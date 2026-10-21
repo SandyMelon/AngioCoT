@@ -1,5 +1,11 @@
 # AngioCoT
 
+## Data
+- **Dataset:** Pirmoradi, S. (2024). *X-Ray Angiography Images and SYNTAX-Score Dataset*. Figshare. https://doi.org/10.6084/m9.figshare.25801447.v1
+- **Publication:** Mahmoudi, S. S., et al. (2025). *X-ray coronary angiogram images and SYNTAX score to develop machine-learning algorithms for CHD diagnosis*. Scientific Data, 12, 471. https://doi.org/10.1038/s41597-025-04727-0
+The dataset is not included in this repository. Please obtain it from the original source.
+
+
 ```text
 ./
 ├── cot_generation/   # prompt00, multi-round conversation, error correction, convert CoT
